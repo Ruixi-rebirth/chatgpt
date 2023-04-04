@@ -2,7 +2,7 @@
 
 A TUI for ChatGPT API, powered by GPT-3.5-turbo and GPT-4 models.
 
-![chat-gpt](https://user-images.githubusercontent.com/10510431/222810716-31e51038-b2f1-4ebf-bc11-c827da3ed0c9.gif)
+![chatgpt-1 0](https://user-images.githubusercontent.com/10510431/229564407-e4c0b6bf-adfb-40f0-a63c-840dafbc1291.gif)
 
 ## Usage
 
@@ -11,8 +11,11 @@ Get or create your OpenAI API Key from here: https://platform.openai.com/account
 ```shell
 export OPENAI_API_KEY=xxx
 
-# Continuous chat mode
+# Chat mode
 chatgpt
+
+# Create a new chat and provide a prompt
+chatgpt -n -p translator
 
 # One-time chat mode, easily integrate with other tools
 cat config.yaml | chatgpt -p 'convert this yaml to json'
@@ -37,6 +40,14 @@ brew install j178/tap/chatgpt
 ### Install via [Nix](https://search.nixos.org/packages) on macOS/Linux
 
 ```nix
+environment.systemPackages = [
+  pkgs.chatgpt-cli
+];
+```
+
+### Install via [Nix](https://search.nixos.org/packages) on macOS/Linux
+
+```
 environment.systemPackages = [
   pkgs.chatgpt-cli
 ];
@@ -138,9 +149,18 @@ then use `-p` flag to switch prompt:
 chatgpt -p translator
 ```
 
-### Custom endpoint
-If you cannot access to the default `https://api.openai.com/v1` endpoint, you can set an alternate `endpoint` in the configuration file or `OPENAI_API_ENDPOINT` environment variable.
-Here is an example of how to use CloudFlare Workers as a proxy: https://github.com/noobnooc/noobnooc/discussions/9
+> **Note**
+> The prompt can be a predefined prompt, or come up with one on the fly.
+> e.g. `chatgpt -p translator` or `chatgpt -p "You are a cat. You can only meow. That's it."`
+
+## Troubleshooting
+
+1. `Error: unexpected EOF, please try again`
+
+    In most cases, this is usually an invalid API key or being banned from OpenAI. To check for any error messages, please execute `echo hello | chatgpt`.
+
+    If you cannot access to the default `https://api.openai.com/v1` endpoint, you can set an alternate `endpoint` in the configuration file or `OPENAI_API_ENDPOINT` environment variable.
+    Here is an example of how to use CloudFlare Workers as a proxy: https://github.com/noobnooc/noobnooc/discussions/9
 
 ## License
 

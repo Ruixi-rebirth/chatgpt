@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -31,12 +32,8 @@ import (
 	"github.com/muesli/reflow/wrap"
 	"github.com/postfinance/single"
 	"github.com/sashabaranov/go-openai"
-)
 
-var (
-	senderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
-	botStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+	"github.com/j178/chatgpt/tokenizer"
 )
 
 var (
@@ -61,6 +58,7 @@ type (
 // TODO support switch prompt in TUI
 
 func main() {
+	log.SetFlags(0)
 	flag.Parse()
 	if *showVersion {
 		fmt.Print(buildVersion())
@@ -77,17 +75,26 @@ func main() {
 
 	chatgpt := newChatGPT(conf)
 	// One-time ask-and-response mode
-	if !isatty.IsTerminal(os.Stdin.Fd()) && !isatty.IsCygwinTerminal(os.Stdin.Fd()) {
-		question, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			exit(err)
+	args := flag.Args()
+	pipeIn := !isatty.IsTerminal(os.Stdin.Fd()) && !isatty.IsCygwinTerminal(os.Stdin.Fd())
+	if pipeIn || len(args) > 0 {
+		var question string
+		if pipeIn {
+			data, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				exit(err)
+			}
+			question = string(data)
+		} else {
+			question = strings.Join(args, " ")
 		}
+
 		conversationConf := conf.Conversation
-		answer, err := chatgpt.ask(conversationConf, string(question))
+		answer, err := chatgpt.ask(conversationConf, question)
 		if err != nil {
 			exit(err)
 		}
-		fmt.Print(answer)
+		fmt.Println(answer)
 		return
 	}
 
@@ -117,7 +124,7 @@ func main() {
 		initialModel(chatgpt, conversations),
 		// enable mouse motion will make text not able to select
 		// tea.WithMouseCellMotion(),
-		// tea.WithAltScreen(),
+		tea.WithAltScreen(),
 	)
 	if debug {
 		f, _ := tea.LogToFile("chatgpt.log", "")
@@ -381,15 +388,17 @@ type QnA struct {
 }
 
 type Conversation struct {
-	manager   *ConversationManager
-	Config    ConversationConfig `json:"config"`
-	Forgotten []QnA              `json:"forgotten,omitempty"`
-	Context   []QnA              `json:"context,omitempty"`
-	Pending   *QnA               `json:"pending,omitempty"`
+	manager       *ConversationManager
+	contextTokens int
+	Config        ConversationConfig `json:"config"`
+	Forgotten     []QnA              `json:"forgotten,omitempty"`
+	Context       []QnA              `json:"context,omitempty"`
+	Pending       *QnA               `json:"pending,omitempty"`
 }
 
 func (c *Conversation) AddQuestion(q string) {
 	c.Pending = &QnA{Question: q}
+	c.contextTokens = 0
 }
 
 func (c *Conversation) UpdatePending(ans string, done bool) {
@@ -399,6 +408,7 @@ func (c *Conversation) UpdatePending(ans string, done bool) {
 	c.Pending.Answer += ans
 	if done {
 		c.Context = append(c.Context, *c.Pending)
+		c.contextTokens = 0
 		if len(c.Context) > c.Config.ContextLength {
 			c.Forgotten = append(c.Forgotten, c.Context[0])
 			c.Context = c.Context[1:]
@@ -440,9 +450,17 @@ func (c *Conversation) GetContextMessages() []openai.ChatCompletionMessage {
 	return messages
 }
 
+func (c *Conversation) GetContextTokens() int {
+	if c.contextTokens == 0 {
+		c.contextTokens = tokenizer.CountMessagesTokens(c.Config.Model, c.GetContextMessages())
+	}
+	return c.contextTokens
+}
+
 func (c *Conversation) ForgetContext() {
 	c.Forgotten = append(c.Forgotten, c.Context...)
 	c.Context = nil
+	c.contextTokens = 0
 }
 
 func (c *Conversation) PendingAnswer() string {
@@ -592,6 +610,8 @@ type model struct {
 	viewport      viewport.Model
 	textarea      textarea.Model
 	help          help.Model
+	spin          spinner.Model
+	spinning      bool
 	inputMode     InputMode
 	err           error
 	chatgpt       *ChatGPT
@@ -621,6 +641,7 @@ func initialModel(chatgpt *ChatGPT, conversations *ConversationManager) model {
 	ta.ShowLineNumbers = false
 
 	vp := viewport.New(50, 5)
+	spin := spinner.New(spinner.WithSpinner(spinner.Points))
 	renderer, _ := glamour.NewTermRenderer(
 		glamour.WithEnvironmentConfig(),
 		glamour.WithWordWrap(0), // we do hard-wrapping ourselves
@@ -631,6 +652,7 @@ func initialModel(chatgpt *ChatGPT, conversations *ConversationManager) model {
 		textarea:      ta,
 		viewport:      vp,
 		help:          help.New(),
+		spin:          spin,
 		chatgpt:       chatgpt,
 		conversations: conversations,
 		keymap:        keymap,
@@ -646,7 +668,7 @@ func savePeriodically() tea.Cmd {
 }
 
 func (m model) Init() tea.Cmd {
-	var cmds []tea.Cmd
+	cmds := []tea.Cmd{tea.EnterAltScreen}
 	if !debug { // disable blink when debug
 		cmds = append(cmds, textarea.Blink)
 	}
@@ -676,15 +698,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.help.Width = msg.Width
 		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - m.textarea.Height() - lipgloss.Height(m.bottomLine())
+		m.viewport.Height = msg.Height - m.textarea.Height() - lipgloss.Height(m.RenderFooter())
 		m.textarea.SetWidth(msg.Width)
 		m.viewport.SetContent(m.RenderConversation(m.viewport.Width))
 		m.viewport.GotoBottom()
+	case spinner.TickMsg:
+		if m.spinning {
+			m.spin, cmd = m.spin.Update(msg)
+			cmds = append(cmds, cmd)
+		}
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keymap.ShowHelp, m.keymap.HideHelp):
 			m.help.ShowAll = !m.help.ShowAll
-			m.viewport.Height = m.height - m.textarea.Height() - lipgloss.Height(m.bottomLine())
+			m.viewport.Height = m.height - m.textarea.Height() - lipgloss.Height(m.RenderFooter())
 			m.viewport.SetContent(m.RenderConversation(m.viewport.Width))
 		case key.Matches(msg, m.keymap.Submit):
 			if m.chatgpt.answering {
@@ -698,6 +725,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(
 				cmds,
 				m.chatgpt.send(m.conversations.Curr().Config, m.conversations.Curr().GetContextMessages()),
+			)
+			// Start answer spinner
+			m.spinning = true
+			cmds = append(
+				cmds, func() tea.Msg {
+					return m.spin.Tick()
+				},
 			)
 			m.viewport.SetContent(m.RenderConversation(m.viewport.Width))
 			m.viewport.GotoBottom()
@@ -754,12 +788,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				UseMultiLineInputMode(&m)
 				m.textarea.ShowLineNumbers = true
 				m.textarea.SetHeight(2)
-				m.viewport.Height--
+				m.viewport.Height = m.height - m.textarea.Height() - lipgloss.Height(m.RenderFooter())
 			} else {
 				UseSingleLineInputMode(&m)
 				m.textarea.ShowLineNumbers = false
 				m.textarea.SetHeight(1)
-				m.viewport.Height++
+				m.viewport.Height = m.height - m.textarea.Height() - lipgloss.Height(m.RenderFooter())
 			}
 			m.viewport.SetContent(m.RenderConversation(m.viewport.Width))
 		case key.Matches(msg, m.keymap.Copy):
@@ -804,13 +838,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 	case answerMsg:
 		m.conversations.Curr().UpdatePending(string(msg), true)
+		m.spinning = false
 		m.chatgpt.done()
 		m.viewport.SetContent(m.RenderConversation(m.viewport.Width))
 		m.viewport.GotoBottom()
 		m.textarea.Placeholder = "Send a message..."
 		m.textarea.Focus()
 	case saveMsg:
-		m.err = m.conversations.Dump()
+		_ = m.conversations.Dump()
 		cmds = append(cmds, savePeriodically())
 	case errMsg:
 		// Network problem or answer completed, can't tell
@@ -821,14 +856,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.err = msg
 		}
+		m.spinning = false
 		m.conversations.Curr().UpdatePending("", true)
 		m.chatgpt.done()
+		m.viewport.SetContent(m.RenderConversation(m.viewport.Width))
+		m.viewport.GotoBottom()
 		m.textarea.Placeholder = "Send a message..."
 		m.textarea.Focus()
 	}
 
 	return m, tea.Batch(cmds...)
 }
+
+var (
+	senderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
+	botStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+	footerStyle = lipgloss.NewStyle().Height(1).BorderTop(true).
+			BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("8")).Faint(true)
+)
 
 func (m model) RenderConversation(maxWidth int) string {
 	var sb strings.Builder
@@ -880,33 +926,80 @@ func (m model) RenderConversation(maxWidth int) string {
 	return sb.String()
 }
 
-func (m model) bottomLine() string {
-	var bottomLine string
+func (m model) RenderFooter() string {
 	if m.err != nil {
-		bottomLine = errorStyle.Render(fmt.Sprintf("error: %v", m.err))
-	}
-	if bottomLine == "" {
-		bottomLine = m.help.View(m.keymap)
-	}
-	var conversationIndicator string
-	if m.conversations.Len() > 1 {
-		conversationIdx := m.conversations.Idx
-		conversationIndicator = fmt.Sprintf("(%d/%d) ", conversationIdx+1, m.conversations.Len())
-	}
-	if m.help.ShowAll {
-		conversationIndicator = ""
+		return footerStyle.Render(errorStyle.Render(fmt.Sprintf("error: %v", m.err)))
 	}
 
-	bottomLine = conversationIndicator + bottomLine
-	return lipgloss.NewStyle().PaddingTop(1).Render(bottomLine)
+	// spinner
+	var columns []string
+	if m.spinning {
+		columns = append(columns, m.spin.View())
+	} else {
+		columns = append(columns, m.spin.Spinner.Frames[0])
+	}
+
+	// conversation indicator
+	if m.conversations.Len() > 1 {
+		conversationIdx := fmt.Sprintf("%s %d/%d", ConversationIcon, m.conversations.Idx+1, m.conversations.Len())
+		columns = append(columns, conversationIdx)
+	}
+
+	// token count
+	question := m.textarea.Value()
+	if m.conversations.Curr().Len() > 0 || len(question) > 0 {
+		tokens := m.conversations.Curr().GetContextTokens()
+		if len(question) > 0 {
+			messages := []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: question,
+				},
+			}
+			tokens += tokenizer.CountMessagesTokens(m.conversations.Curr().Config.Model, messages)
+		}
+		columns = append(columns, fmt.Sprintf("%s %d", TokenIcon, tokens))
+	}
+
+	// help
+	columns = append(columns, fmt.Sprintf("%s ctrl+h", HelpIcon))
+
+	// prompt
+	prompt := m.conversations.Curr().Config.Prompt
+	prompt = fmt.Sprintf("%s %s", PromptIcon, prompt)
+	columns = append(columns, prompt)
+
+	totalWidth := lipgloss.Width(strings.Join(columns, ""))
+	padding := (m.width - totalWidth) / (len(columns) - 1)
+	if padding < 0 {
+		padding = 2
+	}
+
+	if totalWidth+(len(columns)-1)*padding > m.width {
+		remainingSpace := m.width - (lipgloss.Width(
+			strings.Join(columns[:len(columns)-1], ""),
+		) + (len(columns)-2)*padding + 3)
+		columns[len(columns)-1] = columns[len(columns)-1][:remainingSpace] + "..."
+	}
+
+	footer := strings.Join(columns, strings.Repeat(" ", padding))
+	footer = footerStyle.Render(footer)
+	if m.help.ShowAll {
+		return "\n" + m.help.View(m.keymap) + "\n" + footer
+	}
+	return footer
 }
 
 func (m model) View() string {
+	if m.width == 0 || m.height == 0 {
+		return "Initializing..."
+	}
+
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		m.viewport.View(),
 		m.textarea.View(),
-		m.bottomLine(),
+		m.RenderFooter(),
 	)
 }
 
